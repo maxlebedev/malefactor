@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{config::INPUT, gui};
 
 use super::gamelog::GameLog;
@@ -15,7 +17,7 @@ pub fn make_character(ecs: &mut World) {
     systems::spell::fireball_spell(ecs, config::CONFIG.hk1.clone());
 }
 
-fn try_move_player(delta_x: i32, delta_y: i32, ecs: &mut World) {
+fn try_move_player(delta_x: i32, delta_y: i32, ecs: &mut World) -> RunState {
     let mut positions = ecs.write_storage::<Position>();
     let mut players = ecs.write_storage::<Player>();
     let mut viewsheds = ecs.write_storage::<Viewshed>();
@@ -34,7 +36,7 @@ fn try_move_player(delta_x: i32, delta_y: i32, ecs: &mut World) {
             || pos.y + delta_y < 1
             || pos.y + delta_y > map.height - 1
         {
-            return;
+            return RunState::AwaitingInput;
         }
 
         let destination_idx = map.xy_idx(pos.x + delta_x, pos.y + delta_y);
@@ -49,7 +51,7 @@ fn try_move_player(delta_x: i32, delta_y: i32, ecs: &mut World) {
                         },
                     )
                     .expect("Add target failed");
-                return;
+                return RunState::PlayerTurn;
             }
         }
         if !map.blocked[destination_idx] {
@@ -62,6 +64,7 @@ fn try_move_player(delta_x: i32, delta_y: i32, ecs: &mut World) {
             viewshed.dirty = true;
         }
     }
+    RunState::PlayerTurn
 }
 
 fn _cast_spell(ecs: &mut World) {
@@ -92,7 +95,7 @@ fn _cast_spell(ecs: &mut World) {
         .expect("Unable to insert want to cast");
 }
 
-fn get_item(ecs: &mut World) {
+fn get_item(ecs: &mut World) -> RunState {
     let player_pos = ecs.fetch::<Point>();
     let player_entity = ecs.fetch::<Entity>();
     let entities = ecs.entities();
@@ -108,9 +111,10 @@ fn get_item(ecs: &mut World) {
     }
 
     match target_item {
-        None => gamelog
-            .entries
-            .push("There is nothing here to pick up.".to_string()),
+        None => {
+            gamelog.entries.push("There is nothing here to pick up.".to_string());
+            return RunState::AwaitingInput;
+        },
         Some(item) => {
             let mut pickup = ecs.write_storage::<WantsToPickupItem>();
             pickup
@@ -122,51 +126,54 @@ fn get_item(ecs: &mut World) {
                     },
                 )
                 .expect("Unable to insert want to pickup");
+            return RunState::PlayerTurn;
         }
     }
 }
 
-fn use_hotkey(_ecs: &mut World, key: VirtualKeyCode) {
+fn use_hotkey(_ecs: &mut World, key: VirtualKeyCode) -> RunState{
     // TODO: some kind of key:item entity lookup
     dbg!(key);
+    RunState::PlayerTurn
+}
+
+fn descend(ecs: &mut World) -> RunState{
+    if map::try_next_level(ecs) {
+        return RunState::NextLevel;
+    }
+    RunState::AwaitingInput
+}
+
+fn to_main_menu() -> RunState {
+    return RunState::MainMenu { game_started: true, menu_selection: (gui::MainMenuSelection::NewGame)};
 }
 
 // TODO: protect from overflow on char/item select window
 
 pub fn player_input(gs: &mut State, ctx: &mut Rltk) -> RunState {
-    let hotkeys = vec![INPUT.hk1, INPUT.hk2, INPUT.hk3, INPUT.hk4];
+    let mut player_action_map: HashMap<VirtualKeyCode, Box<dyn Fn(&mut World) -> RunState>> = HashMap::new();
+    player_action_map.insert(INPUT.left, Box::new(|w| try_move_player(-1, 0, w)));
+    player_action_map.insert(INPUT.down, Box::new(|w| try_move_player(0, 1, w)));
+    player_action_map.insert(INPUT.up, Box::new(|w| try_move_player(0, -1, w)));
+    player_action_map.insert(INPUT.right, Box::new(|w| try_move_player(1, 0, w)));
+    player_action_map.insert(INPUT.pick_up, Box::new(|w| get_item(w)));
+    player_action_map.insert(INPUT.inventory, Box::new(|_| return RunState::ShowInventory { selection: 0 }));
+    player_action_map.insert(INPUT.select, Box::new(|w| descend(w)));
+    player_action_map.insert(INPUT.exit, Box::new(|_| to_main_menu()));
+    player_action_map.insert(INPUT.wait, Box::new(|_| return RunState::PlayerTurn));
+
+    player_action_map.insert(INPUT.hk1, Box::new(|w| use_hotkey(w, INPUT.hk1)));
+    player_action_map.insert(INPUT.hk2, Box::new(|w| use_hotkey(w, INPUT.hk2)));
+    player_action_map.insert(INPUT.hk3, Box::new(|w| use_hotkey(w, INPUT.hk3)));
+    player_action_map.insert(INPUT.hk4, Box::new(|w| use_hotkey(w, INPUT.hk4)));
+
     match ctx.key {
-        None => return RunState::AwaitingInput, // Nothing happened
-        Some(key) => match key {
-            // TODO: I still don't understand why I have to do do `_ if key ==`
-            _ if key == INPUT.left => try_move_player(-1, 0, &mut gs.ecs),
-            _ if key == INPUT.down => try_move_player(0, 1, &mut gs.ecs),
-            _ if key == INPUT.up => try_move_player(0, -1, &mut gs.ecs),
-            _ if key == INPUT.right => try_move_player(1, 0, &mut gs.ecs),
-
-            _ if key == INPUT.pick_up => get_item(&mut gs.ecs),
-            _ if key == INPUT.inventory => return RunState::ShowInventory { selection: 0 },
-
-            _ if hotkeys.contains(&key) => use_hotkey(&mut gs.ecs, key),
-                // cast_spell(&mut gs.ecs),
-            _ if key == INPUT.select => {
-                // refactor to be context-dependant on tile
-                if map::try_next_level(&mut gs.ecs) {
-                    return RunState::NextLevel;
-                }
+        None => return RunState::AwaitingInput,
+        Some(key) => {
+            if !player_action_map.contains_key(&key){
+                return RunState::PlayerTurn;
             }
-
-            _ if key == INPUT.exit => {
-                return RunState::MainMenu {
-                    game_started: true,
-                    menu_selection: gui::MainMenuSelection::NewGame,
-                }
-            }
-
-            _ if key == INPUT.wait => return RunState::PlayerTurn,
-
-            _ => return RunState::AwaitingInput,
-        },
+            return player_action_map.get(&key).unwrap()(&mut gs.ecs);
+        }
     }
-    RunState::PlayerTurn
 }
